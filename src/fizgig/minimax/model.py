@@ -627,6 +627,12 @@ class MiniMaxH3DiT(nn.Module):
         # Pack the reference's silence audio block (see the AUDIO_* constants above). Off is an
         # escape hatch for A/B only — the base was trained with these rows present.
         self.pack_audio_rows = True
+        # Level-of-Token tail (Nakayama et al., arXiv 2610.05816): None = the dense forward.
+        # Set to a MiniMax-H3 `scripts/lot/h3_splice.LotSplice` to run the TARGET video on a
+        # mixed-extent layout — shorter sequence, same dense output. Keyframes, refs, text and
+        # audio rows are untouched. This file never imports the splice. Not with TREAD, not
+        # with forward_cached.
+        self._lot = None
 
     def _time_embedding(self, t: torch.Tensor) -> torch.Tensor:
         """[M] cleanness values in [0,1] -> [M, time_embed_dim] modulation input.
@@ -806,6 +812,9 @@ class MiniMaxH3DiT(nn.Module):
         """
         if video_latent.shape[0] != 1:
             raise ValueError("MiniMax H3 image training is batch size 1 (pack one image per step)")
+        lot = getattr(self, "_lot", None)
+        if lot is not None and getattr(self, "_tread", None) is not None:
+            raise RuntimeError("LoT and TREAD cannot both be set")
         device = video_latent.device
         dtype = text_embeds.dtype
         _, _, latent_t, lat_h, lat_w = video_latent.shape
@@ -820,8 +829,13 @@ class MiniMaxH3DiT(nn.Module):
         # Rows are built fp32 for precision, but the projection loads at whatever dtype
         # the checkpoint stored (fp32 island on the pruned file, bf16 elsewhere) — feed
         # it its own dtype, same rule as TimeEmbedder (review, 25 Aug).
-        video_embed = self.video_patch_proj(
-            video_rows.to(self.video_patch_proj.weight.dtype)).to(dtype)
+        lot_tokens = None
+        if lot is not None:
+            lot_tokens = lot.video_tokens(video_rows, latent_t, lat_h, lat_w)
+            video_embed = lot.embed_rows(lot_tokens).to(dtype)
+        else:
+            video_embed = self.video_patch_proj(
+                video_rows.to(self.video_patch_proj.weight.dtype)).to(dtype)
 
         # r2v reference condition rows. Same patchify + projection as the target, but blended
         # with a trace of noise first: r = aug*r + (1-aug)*noise. The reference restarts the SAME
@@ -955,7 +969,10 @@ class MiniMaxH3DiT(nn.Module):
         # rope
         pos = image_position_ids(text_len, lat_h, lat_w, n_audio_latents,
                                  refs=ref_shapes or None, latent_t=latent_t,
-                                 keyframes=kf_indices or None).to(device)
+                                 keyframes=kf_indices or None)
+        if lot is not None:
+            pos = lot.replace_video_positions(pos, latent_t, lat_h, lat_w)
+        pos = pos.to(device)
         cos, sin = rope_cos_sin(pos, self.rope.inv_freq.to(device))
         cos, sin = cos.to(dtype), sin.to(dtype)
 
@@ -1015,7 +1032,16 @@ class MiniMaxH3DiT(nn.Module):
             if _off is not None and i >= self._swap_from:
                 _off.submit_move_blocks_forward(i)
 
-        v = self.final_layer(h[video_start:], t_emb, video_t_index)              # [n_video, video_patch_dim]
+        if lot is not None:
+            # Shared RMSNorm + AdaLN, then the splice's extent heads replace video_out. The
+            # splice recovers the dense velocity in THIS head's convention (x0 - noise), so the
+            # samplers step it unchanged. sigma is the noise level, t_val stays cleanness.
+            sigma = (1.0 - t_val).clamp(0.0, 1.0)
+            modulated = lot.modulate(self.final_layer, h[video_start:], t_emb, video_t_index)
+            v = lot.project_rows(modulated, lot_tokens, sigma)
+            v = v.to(self.final_layer.video_out.weight.dtype)
+        else:
+            v = self.final_layer(h[video_start:], t_emb, video_t_index)          # [n_video, video_patch_dim]
         out = unpatchify_video(v, latent_t, lat_h // self.patch_size[1], lat_w // self.patch_size[2],
                                self.latents_dim, self.patch_size)
         out = out.to(video_latent.dtype)
@@ -1048,6 +1074,8 @@ class MiniMaxH3DiT(nn.Module):
         doesn't use them), and a live H2D offloader disables resume (its ring assumes a walk
         from _swap_from) — the pass silently runs in full instead.
         """
+        if getattr(self, "_lot", None) is not None:
+            raise RuntimeError("forward_cached does not support a LoT tail — use forward()")
         if keyframes:
             # The cache entries key on a fixed sequence layout; a keyframe changes it, and
             # the resume is off on H3 anyway (measured misleading). Say so, don't guess.
